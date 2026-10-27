@@ -32,6 +32,7 @@ use App\Models\Fsm\Feedback;
 use Schema;
 use App\Services\Maps\MapsService;
 use Illuminate\Support\Facades\Validator;
+use DOMDocument;
 
 
 class MapsController extends Controller
@@ -356,12 +357,137 @@ class MapsController extends Controller
 
     public function buildingSchoolBufferInfo(Request $request)
     {
-        $bin      = $request->get('val');           // ?val=B008333
-        $distance = $request->get('distance', 200); // default 200
+        $distance = 200;
+        $includeAll = $request->boolean('include_all');
 
-        $result = $this->mapsService->getBuildingSchoolBufferInfo($bin, $distance);
+        if ($request->filled('lat') && $request->filled('long')) {
+            $request->validate([
+                'lat' => 'numeric|between:-90,90',
+                'long' => 'numeric|between:-180,180',
+            ]);
+
+            $result = $this->mapsService->getSchoolBufferInfo(
+                (float) $request->get('long'),
+                (float) $request->get('lat'),
+                $distance,
+                $includeAll
+            );
+
+            return response()->json($result);
+        }
+
+        $bin = $request->get('val');
+
+        if (!$bin) {
+            return response()->json(['message' => __('Please provide a BIN number or location.')], 422);
+        }
+
+        $result = $this->mapsService->getBuildingSchoolBufferInfo($bin, $distance, $includeAll);
 
         return response()->json($result);
+    }
+
+    /**
+     * Find schools within 200 metres of a building BIN or an uploaded KML feature.
+     */
+    public function schoolRadiusSearch(Request $request)
+    {
+        abort_unless(Auth::user()->can('View Nearest Schools On Map'), 403);
+
+        $validator = Validator::make($request->all(), [
+            'source_type' => 'required|in:bin,kml',
+            'bin' => 'required_if:source_type,bin|nullable|string|max:255',
+            'kml' => 'required_if:source_type,kml|nullable|file|max:1024',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['message' => $validator->errors()->first()], 422);
+        }
+
+        if ($request->source_type === 'bin') {
+            $result = $this->mapsService->getBuildingSchoolBufferInfo(trim($request->bin), 200);
+
+            if ($result['center_lat'] === null) {
+                return response()->json(['message' => __('No building was found for this BIN number.')], 404);
+            }
+
+            return response()->json($result);
+        }
+
+        $file = $request->file('kml');
+        if (strtolower($file->getClientOriginalExtension()) !== 'kml') {
+            return response()->json(['message' => __('Please upload a valid KML file.')], 422);
+        }
+
+        $xml = new DOMDocument();
+        $previous = libxml_use_internal_errors(true);
+        $loaded = $xml->load($file->getRealPath(), LIBXML_NONET);
+        libxml_clear_errors();
+        libxml_use_internal_errors($previous);
+
+        if (!$loaded) {
+            return response()->json(['message' => __('The uploaded KML file could not be read.')], 422);
+        }
+
+        $coordinates = $xml->getElementsByTagName('coordinates');
+        if ($coordinates->length === 0) {
+            return response()->json(['message' => __('The KML file does not contain a point or polygon.')], 422);
+        }
+
+        $pairs = preg_split('/\s+/', trim($coordinates->item(0)->nodeValue));
+        $longitudes = [];
+        $latitudes = [];
+
+        foreach ($pairs as $pair) {
+            $parts = explode(',', trim($pair));
+            if (count($parts) < 2 || !is_numeric($parts[0]) || !is_numeric($parts[1])) {
+                continue;
+            }
+
+            $long = (float) $parts[0];
+            $lat = (float) $parts[1];
+            if ($long >= -180 && $long <= 180 && $lat >= -90 && $lat <= 90) {
+                $longitudes[] = $long;
+                $latitudes[] = $lat;
+            }
+        }
+
+        if (!$longitudes) {
+            return response()->json(['message' => __('The KML file has no valid coordinates.')], 422);
+        }
+
+        if (count($longitudes) === 1) {
+            $long = $longitudes[0];
+            $lat = $latitudes[0];
+        } elseif (count($longitudes) >= 4) {
+            $ring = [];
+            foreach ($longitudes as $index => $coordinateLong) {
+                $ring[] = $coordinateLong . ' ' . $latitudes[$index];
+            }
+
+            if ($ring[0] !== end($ring)) {
+                $ring[] = $ring[0];
+            }
+
+            $wkt = 'POLYGON((' . implode(',', $ring) . '))';
+            $center = DB::selectOne("
+                SELECT
+                    ST_X(center_point) AS longitude,
+                    ST_Y(center_point) AS latitude
+                FROM (
+                    SELECT ST_PointOnSurface(ST_MakeValid(ST_GeomFromText(?, 4326))) AS center_point
+                ) center
+            ", [$wkt]);
+
+            $long = (float) $center->longitude;
+            $lat = (float) $center->latitude;
+        } else {
+            return response()->json([
+                'message' => __('The KML must contain either one point or one polygon.')
+            ], 422);
+        }
+
+        return response()->json($this->mapsService->getSchoolBufferInfo($long, $lat, 200));
     }
 
     public function getSchoolPointBufferSchools(Request $request)

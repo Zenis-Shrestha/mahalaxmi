@@ -2007,6 +2007,7 @@ Developed By: Innovative Solution Pvt. Ltd. (ISPL)   -->
                     extent: ol.proj.transformExtent([xmin, ymin, xmax, ymax], 'EPSG:4326', 'EPSG:3857')
                 })
             });
+            window.schoolRadiusMap = map;
 
             /* Nearest  */
             var nearestSchoolSource = new ol.source.Vector();
@@ -2030,11 +2031,23 @@ Developed By: Innovative Solution Pvt. Ltd. (ISPL)   -->
                         });
                     }
 
-                    // Point markers (building & schools)
+                    if (feature.get('type') === 'selected-building') {
+                        return new ol.style.Style({
+                            image: new ol.style.Circle({
+                                radius: 7,
+                                fill: new ol.style.Fill({ color: '#007bff' }),
+                                stroke: new ol.style.Stroke({ color: '#fff', width: 2 })
+                            })
+                        });
+                    }
+
+                    var insideRadius = feature.get('insideRadius');
                     return new ol.style.Style({
                         image: new ol.style.Circle({
                             radius: 6,
-                            fill: new ol.style.Fill({ color: 'rgba(255, 215, 0, 0.9)' }),
+                            fill: new ol.style.Fill({
+                                color: insideRadius ? 'rgba(40, 167, 69, 0.95)' : 'rgba(108, 117, 125, 0.75)'
+                            }),
                             stroke: new ol.style.Stroke({ color: '#333', width: 1 })
                         })
                     });
@@ -2042,6 +2055,7 @@ Developed By: Innovative Solution Pvt. Ltd. (ISPL)   -->
             });
 
             map.addLayer(nearestSchoolLayer);
+            window.dispatchEvent(new Event('school-radius-map-ready'));
 
             /* Nearest */
 
@@ -12584,27 +12598,39 @@ $.ajax({
 
 
     <script>
-    document.addEventListener('DOMContentLoaded', function () {
+    function initializeSchoolRadiusView() {
         var params = new URLSearchParams(window.location.search);
 
-        // Only run when we came from the "Nearest School" button
-        if (params.get('action') !== 'building-nearest-school') return;
+        // Run for the legacy row action or the Schools module radius tool.
+        if (params.get('action') !== 'building-nearest-school' &&
+            params.get('action') !== 'school-radius') return;
 
         var field    = params.get('field') || 'bin';
         var val      = params.get('val');
+        var lat      = params.get('lat');
+        var long     = params.get('long');
         var distance = 200; // metres
 
-        if (!val) {
-            console.warn('No BIN / val provided in URL');
+        if (!val && (!lat || !long)) {
+            console.warn('No BIN or coordinates provided in URL');
+            return;
+        }
+
+        var radiusSource = window.nearestSchoolSource;
+        var radiusMap = window.schoolRadiusMap;
+        if (!radiusSource || !radiusMap) {
             return;
         }
 
         // Clear anything from previous clicks
-        nearestSchoolSource.clear();
+        radiusSource.clear();
 
         $.getJSON("{{ route('maps.building-school-buffer-info') }}", {
             field: field,
             val:   val,
+            lat: lat,
+            long: long,
+            include_all: 1,
             distance: distance
         }).done(function (data) {
 
@@ -12618,25 +12644,29 @@ $.ajax({
             var center3857 = ol.proj.fromLonLat(center4326);
 
             // Move / zoom map
-            map.getView().setCenter(center3857);
-            map.getView().setZoom(18);
+            radiusMap.getView().setCenter(center3857);
+            radiusMap.getView().setZoom(18);
 
             // --- 1) Marker for selected building ---
             var buildingFeature = new ol.Feature({
                 geometry: new ol.geom.Point(center3857),
                 type: 'selected-building'
             });
-            nearestSchoolSource.addFeature(buildingFeature);
+            radiusSource.addFeature(buildingFeature);
 
             // --- 2) 200 m circle in map units (EPSG:3857 uses metres) ---
             var circleGeom = new ol.geom.Circle(center3857, data.distance || distance);
             console.log(circleGeom);
             var circleFeature = new ol.Feature(circleGeom);
-            nearestSchoolSource.addFeature(circleFeature);
+            radiusSource.addFeature(circleFeature);
 
             // --- 3) Nearest schools inside radius ---
-            if (Array.isArray(data.schools)) {
-                data.schools.forEach(function (s) {
+            var schoolsForMap = Array.isArray(data.all_schools) && data.all_schools.length
+                ? data.all_schools
+                : data.schools;
+
+            if (Array.isArray(schoolsForMap)) {
+                schoolsForMap.forEach(function (s) {
                     if (!s.long || !s.lat) return;
 
                     var school3857 = ol.proj.fromLonLat([
@@ -12648,20 +12678,30 @@ $.ajax({
                         geometry: new ol.geom.Point(school3857),
                         type: 'school',
                         name: s.name || 'School',
-                        bin:  s.bin  || ''
+                        bin:  s.bin  || '',
+                        insideRadius: !!s.inside_radius
                     });
 
                     schoolFeature.set('popupHtml',
                         (s.name || 'School') + (s.bin ? ' (' + s.bin + ')' : '')
                     );
 
-                    nearestSchoolSource.addFeature(schoolFeature);
+                    radiusSource.addFeature(schoolFeature);
                 });
             }
 
         }).fail(function (err) {
             console.error('Error fetching building-school-buffer-info', err);
         });
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+        if (window.nearestSchoolSource && window.schoolRadiusMap) {
+            initializeSchoolRadiusView();
+            return;
+        }
+
+        window.addEventListener('school-radius-map-ready', initializeSchoolRadiusView, { once: true });
     });
     </script>
 

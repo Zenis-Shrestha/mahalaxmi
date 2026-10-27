@@ -188,12 +188,12 @@ class EbpsBuildingController extends Controller
     }
     protected function upsertFlat(array $data): void
     {
-        DB::table('ebps_flat_table.ebps_building_info')->updateOrInsert(
+        $this->upsertLatestFlatRecord(
+            data_get($data, 'BldgPrmt_TID')
+                ?? data_get($data, 'Bldgprmt_TID')
+                ?? data_get($data, 'Bldgprmt_tid'),
             [
-                'bldgprmt_tid'     => data_get($data, 'BldgPrmt_TID'),
-                'transaction_type' => data_get($data, 'TransactionType'),
-            ],
-            [
+                'transaction_type'   => data_get($data, 'TransactionType'),
                 'application_number' => data_get($data, 'ApplicationNumber'),
                 'tax_code'           => data_get($data, 'tax_code'),
                 'structure_type'     => data_get($data, 'structureType'),
@@ -204,10 +204,45 @@ class EbpsBuildingController extends Controller
                 'owner'              => data_get($data, 'HouseOwnerNm'),
                 'floor_count'        => data_get($data, 'NoOfStorey'),
                 'location'           => data_get($data, 'ToleName'),
-                'updated_at'         => Carbon::now(),
-                'created_at'         => Carbon::now(),
             ]
         );
+    }
+
+    /**
+     * Keep one latest-state flat row per EBPS permit.
+     *
+     * Vacant Land creates the row. SuperStructure and Completion update it.
+     * Null and empty values are ignored so later stages do not erase useful
+     * values received during an earlier stage.
+     */
+    protected function upsertLatestFlatRecord($ebpsId, array $values): void
+    {
+        if ($ebpsId === null || $ebpsId === '') {
+            throw new \InvalidArgumentException('EBPS building permit ID is required.');
+        }
+
+        // Preserve valid false and 0 values, but ignore null and empty strings.
+        $values = array_filter(
+            $values,
+            static fn ($value) => $value !== null && $value !== ''
+        );
+        $values['updated_at'] = Carbon::now();
+
+        $query = DB::table('ebps_flat_table.ebps_building_info')
+            ->where('bldgprmt_tid', (string) $ebpsId);
+
+        if ($query->exists()) {
+            $query->update($values);
+            return;
+        }
+
+        DB::table('ebps_flat_table.ebps_building_info')->insert(array_merge(
+            [
+                'bldgprmt_tid' => (string) $ebpsId,
+                'created_at'   => Carbon::now(),
+            ],
+            $values
+        ));
     }
     // NEW: upserts a row in building_info.buildings using EBPS payload
     protected function upsertBuildingFromEbps(array $data): Building
@@ -540,8 +575,13 @@ class EbpsBuildingController extends Controller
 
     protected function insertSSdataInFlatTable(array $data)
     {
-        DB::table('ebps_flat_table.ebps_building_info')->insert([
-            'bldgprmt_tid'        => $data['Bldgprmt_TID'] ?? null,
+        $ebpsId = $data['Bldgprmt_TID']
+            ?? $data['BldgPrmt_TID']
+            ?? $data['Bldgprmt_tid']
+            ?? null;
+
+        // Update the flat row created during the Vacant Land stage.
+        $this->upsertLatestFlatRecord($ebpsId, [
             'transaction_type'    => $data['TransactionType_Nm'] ?? null,
             'road_code'           => $data['RodeCode'] ?? null,
             'application_number'  => $data['ApplicationNumber'] ?? null,
@@ -571,8 +611,12 @@ class EbpsBuildingController extends Controller
                                     : null,
 
             // footprints (jsonb) – Laravel will send as text; Postgres will cast if it's valid JSON
-            'ward_building_footprint'     => $data['Field_footprint'] ?? null,
-            'designer_building_footprint' => $data['Designer_footprint'] ?? null,
+            'ward_building_footprint'     => !empty($data['Field_footprint'])
+                                                ? $data['Field_footprint']
+                                                : null,
+            'designer_building_footprint' => !empty($data['Designer_footprint'])
+                                                ? $data['Designer_footprint']
+                                                : null,
 
             // owner/contact
             'owner'        => $data['HouseOwnerNm'] ?? null,
@@ -596,10 +640,6 @@ class EbpsBuildingController extends Controller
 
             // inspection date
             'inspecteddate'        => $data['inspectedDate'] ?? null,
-
-            // timestamps
-            'created_at'           => now(),
-            'updated_at'           => now(),
         ]);
     }
 
@@ -1059,15 +1099,18 @@ class EbpsBuildingController extends Controller
         try {
             $data = $request->all();
             /* dd('DATA RECEIVED', $data); */
-            // EBPS id can come as Bldgprmt_tid OR Bldgprmt_TID
-            $ebpsId = $data['Bldgprmt_TID'] ?? $data['Bldgprmt_tid'] ?? null;
+            // Accept all EBPS permit-ID spellings currently sent by clients.
+            $ebpsId = $data['BldgPrmt_TID']
+                ?? $data['Bldgprmt_TID']
+                ?? $data['Bldgprmt_tid']
+                ?? null;
 
             /* dd($ebpsId); */
 
             if (!$ebpsId) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'Missing Bldgprmt_tid / Bldgprmt_TID in payload',
+                    'message' => 'Missing BldgPrmt_TID / Bldgprmt_TID / Bldgprmt_tid in payload',
                 ], 422);
             }
 
@@ -1105,7 +1148,10 @@ class EbpsBuildingController extends Controller
 
     protected function insertCompletionDataInFlatTable(array $data){
     // ---------- 1) EBPS ID & image saving ----------
-        $ebpsId = $data['Bldgprmt_TID'] ?? $data['Bldgprmt_tid'] ?? null;
+        $ebpsId = $data['BldgPrmt_TID']
+            ?? $data['Bldgprmt_TID']
+            ?? $data['Bldgprmt_tid']
+            ?? null;
 
         $image1 = null;
         $image2 = null;
@@ -1166,11 +1212,12 @@ class EbpsBuildingController extends Controller
             }
         }
 
-        // ---------- 2) Insert only fields that exist in completion payload ----------
-        DB::table('ebps_flat_table.ebps_building_info')->insert([
-            // IDs / meta
-            'bldgprmt_tid'       => $ebpsId,
-            'transaction_type'   => $data['TransactionType_Nm'] ?? null,
+        // ---------- 2) Update the one latest-state flat row for this permit ----------
+        $this->upsertLatestFlatRecord($ebpsId, [
+            // Meta
+            'transaction_type'   => $data['TransactionType_Nm']
+                                        ?? $data['TransactionType']
+                                        ?? 'Completion',
             'application_number' => $data['ApplicationNumber'] ?? null,
 
             // codes
@@ -1199,18 +1246,19 @@ class EbpsBuildingController extends Controller
             'location'    => $data['Location'] ?? null,
 
             // footprints
-            'ward_building_footprint'     => $data['Field_footprint'] ?? null,
-            'designer_building_footprint' => $data['Designer_footprint'] ?? null,
+            'ward_building_footprint'     => !empty($data['Field_footprint'])
+                                                ? $data['Field_footprint']
+                                                : null,
+            'designer_building_footprint' => !empty($data['Designer_footprint'])
+                                                ? $data['Designer_footprint']
+                                                : null,
 
             // images
             'image_1'     => $image1,
             'image_2'     => $image2,
             'image_3'     => $image3,
 
-            // timestamps
-            'created_at'  => Carbon::now(),
-            'updated_at'  => Carbon::now(),
-    ]);
+        ]);
     }
 
     protected function saveCompletionImagesByBin(string $bin, array $photos): void

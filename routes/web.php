@@ -567,8 +567,9 @@ Route::group(['middleware' => 'auth'], function () {
     Route::get('maps/export-containment-report','MapsController@getContainmentReportCsv');
     Route::get('maps/check-location-within-boundary','MapsController@checkLocationWithinBoundary');
     Route::get('maps/toilet-isochrone', 'MapsController@getToiletIsochroneAreaLayers');
-   Route::get('/proxy-wms', 'MapsController@proxyWms');
-   Route::get('maps/building-school-buffer-info', 'MapsController@buildingSchoolBufferInfo')->name('maps.building-school-buffer-info');
+    Route::get('/proxy-wms', 'MapsController@proxyWms');
+    Route::get('maps/building-school-buffer-info', 'MapsController@buildingSchoolBufferInfo')->name('maps.building-school-buffer-info');
+    Route::post('maps/school-radius-search', 'MapsController@schoolRadiusSearch')->name('maps.school-radius-search');
 
 });
 

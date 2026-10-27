@@ -111,10 +111,7 @@ class MapsService {
         $nearestSchoolInfo = null;
 
         if (request()->get('action') === 'building-nearest-school' && request()->get('val')) {
-            $field = request()->get('field', 'bin');
-            $val   = request()->get('val');
-
-            $nearestSchoolInfo = $this->getBuildingSchoolBufferInfo($field, $val);
+            $nearestSchoolInfo = $this->getBuildingSchoolBufferInfo(request()->get('val'));
         }
 
         return view('maps.index', compact('page_title', 'wards', 'location','dueYears', 'maxDate','treatmentPlants',
@@ -1826,7 +1823,7 @@ class MapsService {
     }
 
 
-    public function getBuildingSchoolBufferInfo($bin, $distance = 200)
+    public function getBuildingSchoolBufferInfo($bin, $distance = 200, $includeAll = false)
 {
     // 0) Find the centroid of the building for this BIN (in EPSG:4326)
     $center = DB::selectOne("
@@ -1848,18 +1845,24 @@ class MapsService {
         ];
     }
 
-    $long = $center->c_long;
-    $lat  = $center->c_lat;
+    return $this->getSchoolBufferInfo($center->c_long, $center->c_lat, $distance, $includeAll);
+}
+
+public function getSchoolBufferInfo($long, $lat, $distance = 200, $includeAll = false)
+{
+    $long = (float) $long;
+    $lat = (float) $lat;
+    $distance = 200; // This tool intentionally has a fixed 200 metre radius.
 
     // 1) Polygon buffer (EXACTLY like getPointBufferBuildingsSummary)
     $polygonResult = DB::selectOne("
         SELECT ST_AsText(
             ST_Buffer(
-                ST_SetSRID(ST_Point($long, $lat), 4326)::GEOGRAPHY,
-                $distance
+                ST_SetSRID(ST_Point(?, ?), 4326)::GEOGRAPHY,
+                ?
             )
         ) AS circle_geog
-    ");
+    ", [$long, $lat, $distance]);
 
     $polygon = $polygonResult ? $polygonResult->circle_geog : null;
 
@@ -1871,19 +1874,24 @@ class MapsService {
             sc.name AS school_name,
             ST_AsText(b.geom) AS geom,
             ST_Y(ST_Transform(ST_Centroid(b.geom), 4326)) AS s_lat,
-            ST_X(ST_Transform(ST_Centroid(b.geom), 4326)) AS s_long
+            ST_X(ST_Transform(ST_Centroid(b.geom), 4326)) AS s_long,
+            ROUND(ST_Distance(
+                ST_Transform(ST_Centroid(b.geom), 4326)::geography,
+                ST_SetSRID(ST_Point(?, ?), 4326)::geography
+            )::numeric, 1) AS distance_m
         FROM educationinfo.schools sc
-        JOIN building_info.buildings b
-          ON sc.bin = b.bin,
-        ST_Buffer(
-            ST_SetSRID(ST_Point($long, $lat), 4326)::GEOGRAPHY,
-            $distance
-        ) AS circle_geog
-        WHERE ST_Intersects(circle_geog::GEOMETRY, b.geom)
+        JOIN building_info.buildings b ON sc.bin = b.bin
+        WHERE ST_DWithin(
+            ST_Transform(ST_Centroid(b.geom), 4326)::geography,
+            ST_SetSRID(ST_Point(?, ?), 4326)::geography,
+            ?
+        )
           AND b.deleted_at IS NULL
+          AND sc.deleted_at IS NULL
+        ORDER BY distance_m, sc.name
     ";
 
-    $schoolResults = DB::select($schoolsQuery);
+    $schoolResults = DB::select($schoolsQuery, [$long, $lat, $long, $lat, $distance]);
 
     foreach ($schoolResults as $row) {
         $schools[] = [
@@ -1892,7 +1900,36 @@ class MapsService {
             'lat'   => $row->s_lat,
             'long'  => $row->s_long,
             'geom'  => $row->geom,
+            'distance_m' => (float) $row->distance_m,
+            'inside_radius' => true,
         ];
+    }
+
+    $allSchools = [];
+    if ($includeAll) {
+        $allSchoolResults = DB::select("
+            SELECT b.bin, sc.name AS school_name,
+                ST_Y(ST_Transform(ST_Centroid(b.geom), 4326)) AS s_lat,
+                ST_X(ST_Transform(ST_Centroid(b.geom), 4326)) AS s_long,
+                ST_DWithin(
+                    ST_Transform(ST_Centroid(b.geom), 4326)::geography,
+                    ST_SetSRID(ST_Point(?, ?), 4326)::geography,
+                    ?
+                ) AS inside_radius
+            FROM educationinfo.schools sc
+            JOIN building_info.buildings b ON sc.bin = b.bin
+            WHERE b.deleted_at IS NULL AND sc.deleted_at IS NULL
+        ", [$long, $lat, $distance]);
+
+        foreach ($allSchoolResults as $row) {
+            $allSchools[] = [
+                'bin' => $row->bin,
+                'name' => $row->school_name,
+                'lat' => $row->s_lat,
+                'long' => $row->s_long,
+                'inside_radius' => filter_var($row->inside_radius, FILTER_VALIDATE_BOOLEAN),
+            ];
+        }
     }
 
     return [
@@ -1901,6 +1938,7 @@ class MapsService {
         'distance'    => $distance,
         'polygon'     => $polygon,
         'schools'     => $schools,
+        'all_schools' => $allSchools,
     ];
 }
 
